@@ -10,6 +10,13 @@ import sys
 CAMERA_ID = 0  # 0 is usually the default USB webcam
 ZONE_FILE = "zones.json" # File where we will save our zone settings
 
+# Resolution settings
+CAPTURE_WIDTH = 3840  # 4K width
+CAPTURE_HEIGHT = 2160  # 4K height
+DISPLAY_WIDTH = 1920  # 1080p width
+DISPLAY_HEIGHT = 1080  # 1080p height
+SCALE_FACTOR = DISPLAY_WIDTH / CAPTURE_WIDTH  # 0.5
+
 # Colors for drawing on the screen (Blue, Green, Red)
 COLOR_RED = (0, 0, 255)
 COLOR_GREEN = (0, 255, 0)
@@ -21,6 +28,26 @@ def beep():
     """Plays a system beep."""
     sys.stdout.write('\a')
     sys.stdout.flush()
+
+def scale_to_capture(x, y):
+    """Scale display coordinates (1080p) to capture coordinates (4K)."""
+    return int(x / SCALE_FACTOR), int(y / SCALE_FACTOR)
+
+def scale_to_display(x, y):
+    """Scale capture coordinates (4K) to display coordinates (1080p)."""
+    return int(x * SCALE_FACTOR), int(y * SCALE_FACTOR)
+
+def scale_rect_to_capture(rect):
+    """Scale a rectangle from display to capture coordinates."""
+    x, y, w, h = rect
+    return (int(x / SCALE_FACTOR), int(y / SCALE_FACTOR), 
+            int(w / SCALE_FACTOR), int(h / SCALE_FACTOR))
+
+def scale_rect_to_display(rect):
+    """Scale a rectangle from capture to display coordinates."""
+    x, y, w, h = rect
+    return (int(x * SCALE_FACTOR), int(y * SCALE_FACTOR), 
+            int(w * SCALE_FACTOR), int(h * SCALE_FACTOR))
 
 def enhance_image_for_scanning(image):
     """
@@ -91,12 +118,15 @@ class ZoneManager:
     def get_clicked_zone(self, x, y):
         """
         Returns ('barcode', None) or ('shelf', index) if (x,y) is inside a zone.
+        x, y are in DISPLAY coordinates (1080p).
+        Zones are stored in CAPTURE coordinates (4K).
         Returns None if nothing clicked.
         """
         # Check Barcode Zone
-        bz = self.zones.get("barcode_zone")
-        if bz:
-            (bx, by, bw, bh) = bz
+        bz_4k = self.zones.get("barcode_zone")
+        if bz_4k:
+            # Scale to display coordinates for collision check
+            (bx, by, bw, bh) = scale_rect_to_display(bz_4k)
             # Normalize rectangle coordinates for collision detection if width/height are negative
             if bw < 0: bx, bw = bx + bw, -bw
             if bh < 0: by, bh = by + bh, -bh
@@ -104,8 +134,9 @@ class ZoneManager:
                 return ('barcode', None)
         
         # Check Shelves
-        for i, sh in enumerate(self.zones.get("shelves", [])):
-            (sx, sy, sw, sh_h) = sh
+        for i, sh_4k in enumerate(self.zones.get("shelves", [])):
+            # Scale to display coordinates for collision check
+            (sx, sy, sw, sh_h) = scale_rect_to_display(sh_4k)
             # Normalize rectangle coordinates for collision detection
             if sw < 0: sx, sw = sx + sw, -sw
             if sh_h < 0: sy, sh_h = sy + sh_h, -sh_h
@@ -126,50 +157,47 @@ zm = None
 def draw_rectangle(event, x, y, flags, param):
     """
     This function discovers what the mouse is doing.
-    It is called automatically by OpenCV whenever the mouse moves or clicks.
+    Mouse events are in DISPLAY coordinates (1080p).
+    We scale to CAPTURE coordinates (4K) for storage.
     """
-    global ix, iy, drawing, current_rect, selected_zone, zm # Needs access to zm for collision check
+    global ix, iy, drawing, current_rect, selected_zone, zm
 
     if event == cv2.EVENT_LBUTTONDOWN:
-        # Check if we clicked an existing zone (Select Mode)
+        # Check if we clicked an existing zone (zones are in display coords for rendering)
         clicked = zm.get_clicked_zone(x, y)
         if clicked:
             selected_zone = clicked
             print(f"Selected: {clicked}")
-            return # Don't start drawing if we selected something
+            return
 
-        # Else start drawing
+        # Start drawing (display coordinates)
         drawing = True
         ix, iy = x, y
         current_rect = (x, y, 0, 0)
-        selected_zone = None # Deselect if drawing new
+        selected_zone = None
 
     elif event == cv2.EVENT_MOUSEMOVE:
-        # User is dragging the mouse
         if drawing == True:
-            # Update the width and height of the box as they drag
             width = x - ix
             height = y - iy
             current_rect = (ix, iy, width, height)
 
     elif event == cv2.EVENT_LBUTTONUP:
-        # User let go of the mouse button
         if drawing:
             drawing = False
             width = x - ix
             height = y - iy
             current_rect = (ix, iy, width, height)
-            # We don't save it here; the main loop handles what to do with the finished box
 
 def main():
-    global current_rect, zm, selected_zone # We need to access these global variables
+    global current_rect, zm, selected_zone
 
-    # Initialize the camera
+    # Initialize the camera at 4K
     cap = cv2.VideoCapture(CAMERA_ID)
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAPTURE_WIDTH)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAPTURE_HEIGHT)
 
-    # Load our Zone Helper
+    # Load our Zone Helper (zones stored in CAPTURE coordinates - 4K)
     zm = ZoneManager(ZONE_FILE)
 
     # Setup the mouse listener
@@ -185,19 +213,21 @@ def main():
     tracking_item_name = None
     
     # Placement Logic Variables
-    candidate_shelf = None      # The shelf we are currently mostly likely placing in
-    candidate_lock_time = 0     # Timestamp when we first considered this shelf
-    last_center = None          # For calculating speed
+    candidate_shelf = None
+    candidate_lock_time = 0
+    last_center = None
     
     print("--- Pantry Eye Active ---")
     print("Press 's' to enter Setup Mode to draw/edit zones.")
     print("Press 'q' to Quit.")
     
     while True:
-        ret, frame = cap.read()
+        ret, frame_4k = cap.read()
         if not ret: break
 
-        display_frame = frame.copy()
+        # Downscale to 1080p for display and tracking
+        frame_1080p = cv2.resize(frame_4k, (DISPLAY_WIDTH, DISPLAY_HEIGHT))
+        display_frame = frame_1080p.copy()
         key = cv2.waitKey(1) & 0xFF
 
         # --- LOGIC SWITCH: SETUP vs RUNNING ---
@@ -229,12 +259,14 @@ def main():
 
             elif key == ord(' '):
                 if current_rect:
+                    # Scale from display (1080p) to capture (4K) before saving
+                    rect_4k = scale_rect_to_capture(current_rect)
                     if setup_step == "BARCODE":
-                        zm.set_barcode_zone(current_rect)
+                        zm.set_barcode_zone(rect_4k)
                         print("Barcode zone set.")
                         setup_step = "SHELF"
                     else:
-                        zm.add_shelf(current_rect)
+                        zm.add_shelf(rect_4k)
                         print("Shelf added.")
                     current_rect = None
 
@@ -267,19 +299,22 @@ def main():
                     if zidx is not None and 0 <= zidx < len(shelves):
                         rect = shelves[zidx]
                 if rect:
-                    (rx, ry, rw, rh) = rect
+                    # Scale from 4K to 1080p for display
+                    (rx, ry, rw, rh) = scale_rect_to_display(rect)
                     cv2.rectangle(display_frame, (rx, ry), (rx + rw, ry + rh), COLOR_WHITE, 3)
 
             bz = zm.zones.get("barcode_zone")
             if bz:
-                (bx, by, bw, bh) = bz
+                # Scale from 4K to 1080p for display
+                (bx, by, bw, bh) = scale_rect_to_display(bz)
                 color = COLOR_GREEN
                 if selected_zone and selected_zone[0] == 'barcode': color = COLOR_WHITE
                 cv2.rectangle(display_frame, (bx, by), (bx + bw, by + bh), color, 2)
                 cv2.putText(display_frame, "Barcode Zone", (bx, by - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
 
             for i, sh in enumerate(zm.zones.get("shelves", [])):
-                (sx, sy, sw, sh_h) = sh
+                # Scale from 4K to 1080p for display
+                (sx, sy, sw, sh_h) = scale_rect_to_display(sh)
                 color = COLOR_BLUE
                 if selected_zone and selected_zone == ('shelf', i): color = COLOR_WHITE
                 cv2.rectangle(display_frame, (sx, sy), (sx + sw, sy + sh_h), color, 2)
@@ -287,20 +322,25 @@ def main():
 
 
         elif mode == "RUNNING":
-            # 1. DRAW ZONES
-            bg_zone = zm.zones.get("barcode_zone")
-            if bg_zone:
-                (bx, by, bw, bh) = bg_zone
+            # 1. DRAW ZONES (zones stored in 4K, scale to 1080p for display)
+            bg_zone_4k = zm.zones.get("barcode_zone")
+            bg_zone_display = None
+            if bg_zone_4k:
+                bg_zone_display = scale_rect_to_display(bg_zone_4k)
+                (bx, by, bw, bh) = bg_zone_display
                 cv2.rectangle(display_frame, (bx, by), (bx + bw, by + bh), COLOR_GREEN, 2)
-                if bw > 0 and bh > 0:
-                   scan_area = frame[by:by+bh, bx:bx+bw]
+                # Extract scan area from 4K frame
+                (bx_4k, by_4k, bw_4k, bh_4k) = bg_zone_4k
+                if bw_4k > 0 and bh_4k > 0:
+                   scan_area = frame_4k[by_4k:by_4k+bh_4k, bx_4k:bx_4k+bw_4k]
                 else:
-                   scan_area = frame
+                   scan_area = frame_4k
             else:
-                scan_area = frame
+                scan_area = frame_4k
 
-            for i, sh in enumerate(zm.zones.get("shelves", [])):
-                (sx, sy, sw, sh_h) = sh
+            for i, sh_4k in enumerate(zm.zones.get("shelves", [])):
+                # Scale to 1080p for display
+                (sx, sy, sw, sh_h) = scale_rect_to_display(sh_4k)
                 # Highlight Candidate Shelf in Yellow
                 if candidate_shelf == f"Shelf {i+1}":
                     cv2.rectangle(display_frame, (sx, sy), (sx + sw, sy + sh_h), COLOR_YELLOW, 3)
@@ -312,8 +352,8 @@ def main():
             # 2. SCANNING LOGIC (Only if NOT tracking)
             if tracker is None:
                 # specific "Scanning" text
-                if bg_zone:
-                    (bx, by, bw, bh) = bg_zone
+                if bg_zone_display:
+                    (bx, by, bw, bh) = bg_zone_display
                     cv2.putText(display_frame, "SEARCHING...", (bx, by + bh + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.7, COLOR_GREEN, 2)
                 
                 # Enhance the image for better detection
@@ -329,44 +369,49 @@ def main():
                     print(f"✅ SCANNED: {current_item} - Starting Tracker...")
                     tracking_item_name = current_item
                     
-                    # Initialize Tracker
+                    # Initialize Tracker on 1080p frame
                     tracker = cv2.TrackerCSRT_create()
                     (bx_local, by_local, bw_local, bh_local) = barcode.rect
                     
-                    # Convert to GLOBAL coordinates
-                    if bg_zone:
-                         (gz_x, gz_y, _, _) = bg_zone
-                         global_x = bx_local + gz_x
-                         global_y = by_local + gz_y
+                    # Convert to GLOBAL coordinates (in 4K space)
+                    if bg_zone_4k:
+                         (gz_x, gz_y, _, _) = bg_zone_4k
+                         global_x_4k = bx_local + gz_x
+                         global_y_4k = by_local + gz_y
                     else:
-                         global_x = bx_local
-                         global_y = by_local
+                         global_x_4k = bx_local
+                         global_y_4k = by_local
+                    
+                    # Scale to 1080p for tracking
+                    global_x, global_y = scale_to_display(global_x_4k, global_y_4k)
+                    bw_1080p = int(bw_local * SCALE_FACTOR)
+                    bh_1080p = int(bh_local * SCALE_FACTOR)
                     
                     # Context Expansion
-                    pad_w = bw_local * 1.5
-                    pad_h = bh_local * 1.5
+                    pad_w = bw_1080p * 1.5
+                    pad_h = bh_1080p * 1.5
                     start_x = int(global_x - pad_w)
                     start_y = int(global_y - pad_h)
-                    start_w = int(bw_local + (pad_w * 2))
-                    start_h = int(bh_local + (pad_h * 2))
+                    start_w = int(bw_1080p + (pad_w * 2))
+                    start_h = int(bh_1080p + (pad_h * 2))
                     
-                    h_screen, w_screen, _ = frame.shape
+                    # Clamp to 1080p screen
                     start_x = max(0, start_x)
                     start_y = max(0, start_y)
-                    if (start_x + start_w) > w_screen: start_w = w_screen - start_x
-                    if (start_y + start_h) > h_screen: start_h = h_screen - start_y
+                    if (start_x + start_w) > DISPLAY_WIDTH: start_w = DISPLAY_WIDTH - start_x
+                    if (start_y + start_h) > DISPLAY_HEIGHT: start_h = DISPLAY_HEIGHT - start_y
 
                     start_box = (start_x, start_y, start_w, start_h)
-                    tracker.init(frame, start_box)
+                    tracker.init(frame_1080p, start_box)
                     
                     # Reset placement logic
                     candidate_shelf = None
                     candidate_lock_time = 0
                     last_center = None
             
-            # 3. UPDATE TRACKER & PLACEMENT LOGIC
+            # 3. UPDATE TRACKER & PLACEMENT LOGIC (on 1080p frame)
             elif tracker:
-                success, box = tracker.update(frame)
+                success, box = tracker.update(frame_1080p)
                 
                 if success:
                     (tx, ty, tw, th) = [int(v) for v in box]
@@ -379,8 +424,9 @@ def main():
                     
                     # --- CHECK SHELF LOCATION ---
                     hover_shelf = None
-                    for i, sh in enumerate(zm.zones.get("shelves", [])):
-                        (sx, sy, sw, sh_h) = sh
+                    for i, sh_4k in enumerate(zm.zones.get("shelves", [])):
+                        # Scale shelf to 1080p for collision check
+                        (sx, sy, sw, sh_h) = scale_rect_to_display(sh_4k)
                         if (sx < center_x < sx + sw) and (sy < center_y < sy + sh_h):
                             hover_shelf = f"Shelf {i+1}"
                             break
